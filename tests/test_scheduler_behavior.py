@@ -1,4 +1,5 @@
 import datetime
+import json
 import re
 import sys
 import tempfile
@@ -42,7 +43,7 @@ def _install_astrbot_stubs():
 
 _install_astrbot_stubs()
 
-from core.data import ScheduleDataManager  # noqa: E402
+from core.data import ScheduleDataManager, WardrobeDataManager  # noqa: E402
 from core.generator import ScheduleContext, SchedulerGenerator  # noqa: E402
 from core.utils import build_character_state_injection, select_current_activity  # noqa: E402
 
@@ -64,21 +65,24 @@ class _Provider:
     def __init__(self, responses):
         self.responses = list(responses)
         self.prompts = []
+        self.image_urls = []
 
-    async def text_chat(self, prompt, session_id):
+    async def text_chat(self, prompt, session_id, image_urls=None):
         self.prompts.append(prompt)
+        self.image_urls.append(image_urls or [])
         text = self.responses.pop(0) if self.responses else ""
         return types.SimpleNamespace(completion_text=text)
 
 
 class _Context:
-    def __init__(self, provider):
+    def __init__(self, provider, providers=None):
         self.provider = provider
+        self.providers = providers or {}
         self.conversation_manager = _ConversationManager()
         self.persona_manager = _PersonaManager()
 
     def get_provider_by_id(self, provider_id):
-        return None
+        return self.providers.get(provider_id)
 
     def get_using_provider(self):
         return self.provider
@@ -99,6 +103,8 @@ def _config():
         "reference_recent_count": 0,
         "default_reference_umo": "",
         "llm_provider": "",
+        "wardrobe": [],
+        "wardrobe_migration_version": 0,
         "pool": {
             "daily_themes": ["探索日"],
             "mood_colors": ["活力"],
@@ -130,6 +136,10 @@ def _ctx():
         daily_theme="探索日",
         mood_color="活力",
         outfit_style="甜酷混搭风",
+        outfit_plan=(
+            "整体风格：甜酷混搭风；服装：未明确；鞋袜：未明确；"
+            "配饰：未明确；发型：未明确；妆容：未明确。"
+        ),
         schedule_type="户外活动型",
     )
 
@@ -139,7 +149,20 @@ class SchedulerBehaviorTest(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         data_mgr = ScheduleDataManager(Path(self.tmp.name) / "schedule_data.json")
         provider = _Provider(responses)
-        return SchedulerGenerator(_Context(provider), _config(), data_mgr), provider
+        config = _config()
+        wardrobe_mgr = WardrobeDataManager(
+            Path(self.tmp.name) / "wardrobe.json",
+            config,
+        )
+        return (
+            SchedulerGenerator(
+                _Context(provider),
+                config,
+                data_mgr,
+                wardrobe_mgr,
+            ),
+            provider,
+        )
 
     def tearDown(self):
         tmp = getattr(self, "tmp", None)
@@ -204,6 +227,201 @@ class SchedulerBehaviorTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(data.outfit_style, "用户指定")
 
+    def test_reference_session_and_random_prompt_placeholders_are_preserved(self):
+        generator, _ = self._generator()
+        generator.config["default_reference_umo"] = "bot:FriendMessage:42"
+        self.assertEqual(generator._resolve_reference_umo(None), "bot:FriendMessage:42")
+        self.assertEqual(
+            generator._resolve_reference_umo("bot:FriendMessage:99"),
+            "bot:FriendMessage:99",
+        )
+        generator.config["prompt_template"] = '值={r1}; JSON={{"outfit": "x"}}'
+        rendered = generator._build_prompt(_ctx())
+        self.assertRegex(rendered, r"值=\d{1,3}")
+        self.assertIn('{"outfit": "x"}', rendered)
+
+    async def test_image_description_uses_image_provider_and_relaxes_random_style(self):
+        generator, provider = self._generator(
+            [
+                (
+                    '{"overall_style":"清爽通勤","clothing":"白色衬衫搭配蓝色半裙",'
+                    '"footwear":"","accessories":"","hair":"","makeup":"",'
+                    '"details":"","constraints":"","scene":"咖啡馆",'
+                    '"pose":"坐着","camera":"高角度"}'
+                ),
+                '{"outfit_style":"图片指定","outfit":"白色衬衫搭配蓝色半裙。","schedule":"09:00 上班"}',
+            ]
+        )
+        data = await generator.generate_schedule(
+            datetime.datetime(2026, 5, 24),
+            extra="上班",
+            image_paths=["/tmp/outfit.jpg"],
+        )
+        self.assertEqual(data.status, "ok")
+        self.assertEqual(len(provider.image_urls), 2)
+        self.assertEqual(provider.image_urls[0], ["/tmp/outfit.jpg"])
+        self.assertEqual(provider.image_urls[1], [])
+        self.assertIn("必须排除", provider.prompts[0])
+
+    async def test_wardrobe_transcription_discards_non_outfit_json_fields(self):
+        generator, _ = self._generator(
+            [
+                (
+                    '{"overall_style":"清爽","clothing":"白色短袖搭配蓝色半裙",'
+                    '"footwear":"赤足","accessories":"银色项链",'
+                    '"hair":"低马尾","makeup":"淡妆","details":"棉质、合身版型",'
+                    '"constraints":"不穿鞋袜","scene":"海边","pose":"挥手",'
+                    '"camera":"俯拍","weather":"晴天"}'
+                )
+            ]
+        )
+
+        result = await generator._describe_images(["/tmp/look.jpg"])
+
+        self.assertIn("白色短袖", result)
+        self.assertIn("赤足", result)
+        self.assertIn("不穿鞋袜", result)
+        self.assertNotIn("海边", result)
+        self.assertNotIn("挥手", result)
+        self.assertNotIn("俯拍", result)
+        self.assertNotIn("晴天", result)
+
+    async def test_text_only_wardrobe_description_uses_main_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main_provider = _Provider(
+                [
+                    (
+                        '{"overall_style":"通勤","clothing":"白衬衫搭配蓝色半裙",'
+                        '"footwear":"","accessories":"","hair":"","makeup":"",'
+                        '"details":"","constraints":"","scene":"公司"}'
+                    )
+                ]
+            )
+            image_provider = _Provider(["不应调用视觉模型"])
+            config = _config()
+            config["image_provider"] = "vision"
+            context = _Context(main_provider, {"vision": image_provider})
+            generator = SchedulerGenerator(
+                context,
+                config,
+                ScheduleDataManager(Path(tmp) / "schedule_data.json"),
+            )
+
+            result = await generator._describe_images(
+                [], user_text="白衬衫搭配蓝色半裙"
+            )
+
+            self.assertIn("白衬衫搭配蓝色半裙", result)
+            self.assertNotIn("公司", result)
+            self.assertEqual(len(main_provider.image_urls), 1)
+            self.assertEqual(main_provider.image_urls[0], [])
+            self.assertEqual(image_provider.prompts, [])
+
+    def test_wardrobe_manager_persists_and_formats_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "wardrobe": [],
+                "wardrobe_migration_version": 1,
+                "pool": {"outfit_styles": []},
+            }
+            manager = WardrobeDataManager(Path(tmp) / "wardrobe.json", config)
+            entry = manager.add("白色衬衫搭配蓝色半裙", note="适合通勤")
+            loaded = WardrobeDataManager(Path(tmp) / "wardrobe.json", config)
+            self.assertEqual(loaded.find("蓝色半裙")["id"], entry["id"])
+            self.assertNotIn("适合通勤", loaded.for_prompt())
+            updated = loaded.replace(entry["id"], "白色衬衫搭配蓝色半裙，赤足不穿鞋袜")
+            self.assertEqual(updated["id"], entry["id"])
+            self.assertIn("赤足", loaded.for_prompt())
+
+            newer = loaded.add("黑色针织衫搭配灰色长裤")
+            self.assertEqual(
+                loaded.find_by_number(1)["description"],
+                "白色衬衫搭配蓝色半裙，赤足不穿鞋袜",
+            )
+            self.assertEqual(loaded.find_by_number(2)["id"], newer["id"])
+            self.assertIsNone(loaded.find_by_number(3))
+            self.assertEqual(loaded.find_for_user_query("穿搭2")["id"], newer["id"])
+            self.assertEqual(loaded.find_for_user_query("2")["id"], newer["id"])
+            self.assertEqual(
+                config["wardrobe"][-1]["description"], newer["description"]
+            )
+            self.assertEqual(config["wardrobe"][-1]["__template_key"], "outfit")
+
+            config["wardrobe"] = list(reversed(config["wardrobe"]))
+            reordered = WardrobeDataManager(Path(tmp) / "wardrobe.json", config)
+            self.assertEqual(reordered.find_by_number(1)["id"], newer["id"])
+            self.assertEqual(reordered.find_by_number(2)["id"], entry["id"])
+
+    def test_wardrobe_migration_freezes_numbers_and_appends_legacy_styles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "wardrobe.json"
+            path.write_text(
+                json.dumps(
+                    [
+                        {"id": "old", "description": "原先显示为穿搭2"},
+                        {"id": "new", "description": "原先显示为穿搭1"},
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            config = {
+                "wardrobe": [],
+                "wardrobe_migration_version": 0,
+                "pool": {"outfit_styles": ["甜酷混搭风"]},
+            }
+
+            manager = WardrobeDataManager(path, config)
+
+            self.assertEqual(
+                [entry["description"] for entry in manager.display_entries()],
+                [
+                    "原先显示为穿搭1",
+                    "原先显示为穿搭2",
+                    (
+                        "整体风格：甜酷混搭风；服装：未明确；鞋袜：未明确；"
+                        "配饰：未明确；发型：未明确；妆容：未明确。"
+                    ),
+                ],
+            )
+            self.assertEqual(config["wardrobe_migration_version"], 2)
+            self.assertEqual(config["pool"]["outfit_styles"], [])
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), [])
+            self.assertTrue(
+                all(item["__template_key"] == "outfit" for item in config["wardrobe"])
+            )
+
+            reloaded = WardrobeDataManager(path, config)
+            reloaded.add("后来新增的穿搭")
+            self.assertEqual(
+                reloaded.find_by_number(4)["description"], "后来新增的穿搭"
+            )
+
+    def test_schedule_diversity_uses_wardrobe_instead_of_legacy_style_pool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = _config()
+            config["wardrobe_migration_version"] = 1
+            config["wardrobe"] = [
+                "整体风格：清爽通勤；服装：白色衬衫搭配蓝色半裙；鞋袜：白色乐福鞋。"
+            ]
+            config["pool"]["outfit_styles"] = ["不应使用的旧风格"]
+            wardrobe_mgr = WardrobeDataManager(
+                Path(tmp) / "wardrobe.json",
+                config,
+            )
+            generator = SchedulerGenerator(
+                _Context(_Provider([])),
+                config,
+                ScheduleDataManager(Path(tmp) / "schedule_data.json"),
+                wardrobe_mgr,
+            )
+
+            diversity = generator._pick_diversity()
+
+            self.assertEqual(diversity["outfit_style"], "清爽通勤")
+            self.assertIn("白色衬衫", diversity["outfit_plan"])
+            self.assertNotIn("不应使用", diversity["outfit_plan"])
+
     def test_prompt_rendering_survives_crlf_and_literal_json_braces(self):
         generator, _ = self._generator()
         generator.config["prompt_template"] = (
@@ -244,8 +462,7 @@ class SchedulerBehaviorTest(unittest.IsolatedAsyncioTestCase):
     def test_build_prompt_replaces_rN_with_random_integers(self):
         generator, _ = self._generator()
         generator.config["prompt_template"] = (
-            "r1={r1} r2={r2} r99={r99}\n"
-            "style={outfit_style}\n"
+            "r1={r1} r2={r2} r99={r99}\nstyle={outfit_style}\n"
         )
         prompt = generator._build_prompt(_ctx())
 
@@ -273,8 +490,9 @@ class SchedulerBehaviorTest(unittest.IsolatedAsyncioTestCase):
             pair = tuple(prompt.split("-", 1))
             seen_pairs.add(pair)
 
-        self.assertGreaterEqual(len(seen_pairs), 2,
-                                "Expected r1/r2 to vary independently in 10 runs")
+        self.assertGreaterEqual(
+            len(seen_pairs), 2, "Expected r1/r2 to vary independently in 10 runs"
+        )
 
     def test_manual_extra_supports_negative_constraints(self):
         generator, _ = self._generator()
@@ -378,10 +596,7 @@ class SchedulerBehaviorTest(unittest.IsolatedAsyncioTestCase):
 
     def test_select_current_activity_uses_latest_started_entry(self):
         schedule = (
-            "☀️ 上午\n"
-            "- 08:00 起床洗漱\n"
-            "- 09:30 出门去咖啡店看书\n"
-            "- 14:00 去逛街\n"
+            "☀️ 上午\n- 08:00 起床洗漱\n- 09:30 出门去咖啡店看书\n- 14:00 去逛街\n"
         )
         now = datetime.datetime(2026, 5, 24, 9, 38)
         self.assertEqual(
@@ -402,10 +617,7 @@ class SchedulerBehaviorTest(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_select_current_activity_accepts_half_hour_cn_time(self):
-        schedule = (
-            "上午 9点半 出门去咖啡店看书\n"
-            "晚上 20点 回家整理照片\n"
-        )
+        schedule = "上午 9点半 出门去咖啡店看书\n晚上 20点 回家整理照片\n"
         now = datetime.datetime(2026, 5, 24, 9, 45)
         self.assertEqual(
             select_current_activity(schedule, now=now),
@@ -413,10 +625,7 @@ class SchedulerBehaviorTest(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_select_current_activity_accepts_numbered_items(self):
-        schedule = (
-            "1. 08:00 起床洗漱\n"
-            "2、09:30 出门去咖啡店看书\n"
-        )
+        schedule = "1. 08:00 起床洗漱\n2、09:30 出门去咖啡店看书\n"
         now = datetime.datetime(2026, 5, 24, 9, 45)
         self.assertEqual(
             select_current_activity(schedule, now=now),
@@ -424,10 +633,7 @@ class SchedulerBehaviorTest(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_select_current_activity_wraps_to_previous_day_when_needed(self):
-        schedule = (
-            "- 08:00 起床洗漱\n"
-            "- 23:00 窝在被子里看电影\n"
-        )
+        schedule = "- 08:00 起床洗漱\n- 23:00 窝在被子里看电影\n"
         now = datetime.datetime(2026, 5, 25, 2, 10)
         self.assertEqual(
             select_current_activity(schedule, now=now, wrap_previous_day=True),
@@ -488,7 +694,9 @@ class SchedulerBehaviorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen["umo"], "event-umo")
         self.assertEqual(ctx.recent_chats, "recent:event-umo")
 
-    async def test_collect_context_keeps_empty_reference_behavior_when_not_configured(self):
+    async def test_collect_context_keeps_empty_reference_behavior_when_not_configured(
+        self,
+    ):
         generator, _ = self._generator()
 
         ctx = await generator._collect_context(datetime.datetime(2026, 5, 24), None)
@@ -496,11 +704,7 @@ class SchedulerBehaviorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.recent_chats, "无近期对话")
 
     def test_character_state_injection_includes_current_activity(self):
-        schedule = (
-            "- 08:00 起床洗漱\n"
-            "- 09:30 出门去咖啡店看书\n"
-            "- 14:00 去逛街\n"
-        )
+        schedule = "- 08:00 起床洗漱\n- 09:30 出门去咖啡店看书\n- 14:00 去逛街\n"
         inject_text = build_character_state_injection(
             "黑丝和吊带裙",
             schedule,

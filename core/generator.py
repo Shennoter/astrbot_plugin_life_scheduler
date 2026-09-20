@@ -3,9 +3,9 @@ import datetime
 import json
 import random
 import re
+from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
-from dataclasses import asdict, dataclass
 
 from astrbot.api import logger
 from astrbot.core.config.astrbot_config import AstrBotConfig
@@ -29,7 +29,10 @@ class ScheduleContext:
     daily_theme: str
     mood_color: str
     outfit_style: str
+    outfit_plan: str
     schedule_type: str
+    wardrobe: str = ""
+    image_description: str = ""
 
 
 class SchedulerGenerator:
@@ -41,10 +44,12 @@ class SchedulerGenerator:
         context: Context,
         config: AstrBotConfig,
         data_mgr: ScheduleDataManager,
+        wardrobe_mgr=None,
     ):
         self.context = context
         self.config = config
         self.data_mgr = data_mgr
+        self.wardrobe_mgr = wardrobe_mgr
         self._ensure_prompt_template_default()
 
         self._gen_lock = asyncio.Lock()
@@ -55,6 +60,7 @@ class SchedulerGenerator:
         date: datetime.datetime | None = None,
         umo: str | None = None,
         extra: str | None = None,
+        image_paths: list[str] | None = None,
     ) -> ScheduleData:
         async with self._gen_lock:
             if self._generating:
@@ -66,14 +72,21 @@ class SchedulerGenerator:
         date_str = date.strftime("%Y-%m-%d")
         try:
             logger.info(f"正在生成 {date_str} 的日程...")
-            ctx = await self._collect_context(date, umo)
             manual_extra = self._normalize_extra(extra)
+            image_description = ""
+            if image_paths:
+                image_description = await self._describe_images(
+                    image_paths,
+                    user_text=manual_extra,
+                    sid=f"life_scheduler_vision_{date_str}",
+                )
+            ctx = await self._collect_context(date, umo, image_description)
             prompt = self._build_prompt(ctx, manual_extra)
             sid_base = f"life_scheduler_gen_{date_str}"
             content = await self._call_llm(prompt, sid=f"{sid_base}_0")
 
             payload = self._extract_json_obj(content)
-            enforce_style = not manual_extra
+            enforce_style = not manual_extra and not image_description
             ok, reason = self._validate_payload(
                 payload,
                 ctx,
@@ -88,8 +101,12 @@ class SchedulerGenerator:
                         ctx, content, reason, manual_extra
                     )
                 else:
-                    repair_prompt = self._build_style_repair_prompt(ctx, content, reason)
-                content = await self._call_llm(repair_prompt, sid=f"{sid_base}_{attempt}")
+                    repair_prompt = self._build_style_repair_prompt(
+                        ctx, content, reason
+                    )
+                content = await self._call_llm(
+                    repair_prompt, sid=f"{sid_base}_{attempt}"
+                )
                 payload = self._extract_json_obj(content)
                 ok, reason = self._validate_payload(
                     payload,
@@ -102,7 +119,11 @@ class SchedulerGenerator:
                 raise ValueError(f"模型未遵循生成约束：{reason}")
 
             data = self._to_schedule_data(
-                payload, date_str, ctx, manual_extra=manual_extra
+                payload,
+                date_str,
+                ctx,
+                manual_extra=manual_extra,
+                image_description=image_description,
             )
             self.data_mgr.set(data)
             logger.info(
@@ -123,7 +144,10 @@ class SchedulerGenerator:
     # ---------- context ----------
 
     async def _collect_context(
-        self, data: datetime.datetime, umo: str | None
+        self,
+        data: datetime.datetime,
+        umo: str | None,
+        image_description: str = "",
     ) -> ScheduleContext:
         effective_umo = self._resolve_reference_umo(umo)
         logger.debug(f"[LLM] UMO 上下文注入：{effective_umo or '未配置'}")
@@ -134,14 +158,27 @@ class SchedulerGenerator:
             persona_desc=await self._get_persona(),
             history_schedules=self._get_history(data),
             recent_chats=await self._get_recent_chats(effective_umo),
-            **self._pick_diversity(data.date()),
+            wardrobe=(
+                self.wardrobe_mgr.for_prompt()
+                if self.wardrobe_mgr is not None
+                else "（衣柜为空）"
+            ),
+            image_description=image_description,
+            **self._pick_diversity(),
         )
 
     def _resolve_reference_umo(self, umo: str | None) -> str | None:
+        """Resolve the current conversation or the configured fallback session.
+
+        Args:
+            umo: Session origin for the current event.
+
+        Returns:
+            The session origin used for recent-chat context, or None.
+        """
         candidate = str(umo or "").strip()
         if candidate:
             return candidate
-
         default_umo = str(self.config.get("default_reference_umo", "") or "").strip()
         return default_umo or None
 
@@ -163,39 +200,38 @@ class SchedulerGenerator:
             return ""
         return ""
 
-    def _pick_diversity(self, today: datetime.date) -> dict:
+    def _pick_diversity(self) -> dict:
         pool = self.config["pool"]
+        wardrobe_entries = (
+            self.wardrobe_mgr.all() if self.wardrobe_mgr is not None else []
+        )
+        outfit_plan = (
+            random.choice(wardrobe_entries)["description"]
+            if wardrobe_entries
+            else "衣柜为空；请根据人设自由设计完整的服装、鞋袜、配饰、发型和妆容。"
+        )
         return {
             "daily_theme": random.choice(pool["daily_themes"]),
             "mood_color": random.choice(pool["mood_colors"]),
-            "outfit_style": self._pick_outfit_style(pool["outfit_styles"], today),
+            "outfit_style": self._extract_style_from_plan(outfit_plan),
+            "outfit_plan": outfit_plan,
             "schedule_type": random.choice(pool["schedule_types"]),
         }
 
-    def _pick_outfit_style(self, styles: list[str], today: datetime.date) -> str:
-        styles = list(styles or [])
-        if not styles:
-            return ""
+    @staticmethod
+    def _extract_style_from_plan(outfit_plan: str) -> str:
+        """Extract a short style label from a detailed wardrobe plan.
 
-        lookback_days = int(self.config.get("reference_history_days", 0) or 0)
-        if lookback_days <= 0 or len(styles) <= 1:
-            return random.choice(styles)
+        Args:
+            outfit_plan: Selected wardrobe description.
 
-        used: set[str] = set()
-        for i in range(1, lookback_days + 1):
-            date = today - datetime.timedelta(days=i)
-            data = self.data_mgr.get(date)
-            if not data or data.status != "ok":
-                continue
-
-            style = (getattr(data, "outfit_style", "") or "").strip()
-            if not style:
-                style = self._extract_style_from_outfit(data.outfit)
-            if style:
-                used.add(style)
-
-        candidates = [s for s in styles if s not in used]
-        return random.choice(candidates or styles)
+        Returns:
+            A concise style label used by the existing schedule data contract.
+        """
+        match = re.search(r"(?:整体风格|风格)\s*[:：]\s*([^；;\n。]+)", outfit_plan)
+        if match:
+            return match.group(1).strip()
+        return "自由搭配" if "衣柜为空" in outfit_plan else "衣柜方案"
 
     def _extract_style_from_outfit(self, outfit: str) -> str:
         if not outfit:
@@ -220,12 +256,18 @@ class SchedulerGenerator:
 
             outfit = data.outfit[:40]
             schedule = data.schedule[:60]
-            style = (getattr(data, "outfit_style", "") or "").strip() or self._extract_style_from_outfit(data.outfit)
+            style = (
+                getattr(data, "outfit_style", "") or ""
+            ).strip() or self._extract_style_from_outfit(data.outfit)
 
             if style:
-                items.append(f"[{date.strftime('%Y-%m-%d')}] 风格：{style} 穿搭：{outfit} 日程：{schedule}")
+                items.append(
+                    f"[{date.strftime('%Y-%m-%d')}] 风格：{style} 穿搭：{outfit} 日程：{schedule}"
+                )
             else:
-                items.append(f"[{date.strftime('%Y-%m-%d')}] 穿搭：{outfit} 日程：{schedule}")
+                items.append(
+                    f"[{date.strftime('%Y-%m-%d')}] 穿搭：{outfit} 日程：{schedule}"
+                )
 
         return "\n".join(items) if items else "（无历史记录）"
 
@@ -282,7 +324,9 @@ class SchedulerGenerator:
     def _normalize_requirement_text(text: str) -> str:
         return re.sub(r"[\s\"'“”‘’`，,。.!！?？:：;；、（）()\[\]【】<>《》]", "", text)
 
-    _NEGATIVE_MARKER_RE = re.compile(r"不要再|不要|不能|不许|不想|不用|不需要|别再|别|避免|禁止|拒绝")
+    _NEGATIVE_MARKER_RE = re.compile(
+        r"不要再|不要|不能|不许|不想|不用|不需要|别再|别|避免|禁止|拒绝"
+    )
     _OUTFIT_TERM_RE = re.compile(
         r"吊带裙|吊带衫|连衣裙|半身裙|牛仔裤|黑丝|白丝|丝袜|吊带|短裙|长裙|裙|裤|袜|鞋|靴|衣|衫|外套|内衣|内裤|帽|包|耳钉|项链|手链|口红|妆|黑色|白色|红色|粉色|蓝色|绿色|黄色|紫色|灰色|米色|棕色|金色|银色|风格|穿搭"
     )
@@ -382,15 +426,16 @@ class SchedulerGenerator:
     def _build_prompt(self, ctx: ScheduleContext, extra: str | None = None) -> str:
         extra = self._normalize_extra(extra)
         ctx_dict = asdict(ctx)  # 实际有的字段
-        if extra:
+        has_user_outfit = bool(extra or ctx.image_description)
+        if has_user_outfit:
             ctx_dict["outfit_style"] = "用户指定"
+            ctx_dict["outfit_plan"] = "用户本次指定"
             ctx_dict["schedule_type"] = "用户指定"
 
         template = self._get_prompt_template()
         tmpl_vars = set(re.findall(r"\{(\w+)\}", template))
-        # 自动为模板中 {r1} {r2} ... 生成独立 1-100 随机数
         for var in tmpl_vars:
-            if re.match(r'^r\d+$', var):
+            if re.match(r"^r\d+$", var):
                 ctx_dict[var] = str(random.randint(1, 100))
         missing = tmpl_vars - ctx_dict.keys()
         if missing:
@@ -403,6 +448,23 @@ class SchedulerGenerator:
             ctx_dict[k] = ""
         prompt = self._render_prompt_template(template, ctx_dict)
 
+        if not has_user_outfit:
+            prompt += (
+                "\n\n## 今日选定的衣柜方案（必须落实）\n"
+                f"{ctx.outfit_plan}\n"
+                "- 这是今日唯一的穿搭基准，outfit 必须落实其中已明确的服装、鞋袜、配饰、发型、妆容和穿戴约束。\n"
+                "- 标记为‘未明确’的项可以按整体风格补全，不得换掉已明确的单品。\n"
+            )
+
+        if ctx.image_description:
+            prompt += (
+                "\n\n## 用户本次提供的穿搭图片转写（最高优先级）\n"
+                f"{ctx.image_description}\n"
+                "- 这是用户指定的参考穿搭，必须落实到今日 outfit 中。\n"
+                "- 详细描述可见的上衣、下装、外套、鞋袜、配饰、颜色、材质、版型和整体风格。\n"
+                "- 图片看不清或无法确认的细节不要臆造，可以使用‘图片中未明确’。\n"
+            )
+
         if extra:
             prompt += (
                 "\n\n## ✅ 用户补充强制约束（最高优先级，必须严格遵循）\n"
@@ -414,32 +476,30 @@ class SchedulerGenerator:
                 '- JSON 必须包含字段 "outfit_style"、"outfit"、"schedule"。\n'
                 '- 当用户指定了具体穿搭时，"outfit" 必须直接包含这些具体穿搭元素。\n'
             )
-        elif ctx.outfit_style:
+        elif ctx.outfit_style and not ctx.image_description:
             prompt += (
                 "\n\n## ✅ 强制约束（必须严格遵循）\n"
                 f"- 你必须严格遵循穿搭风格：【{ctx.outfit_style}】（不得替换/混用其他风格）。\n"
                 "- 你必须只输出 JSON 对象本体（不要 Markdown/代码块/解释）。\n"
-                f"- JSON 必须包含字段 \"outfit_style\"，且其值必须严格等于 \"{ctx.outfit_style}\"。\n"
-                f"- 字段 \"outfit\" 的第一行必须以 \"风格：{ctx.outfit_style}\" 开头。\n"
+                f'- JSON 必须包含字段 "outfit_style"，且其值必须严格等于 "{ctx.outfit_style}"。\n'
+                f'- 字段 "outfit" 的第一行必须以 "风格：{ctx.outfit_style}" 开头。\n'
             )
 
         return prompt
 
     def _get_prompt_template(self) -> str:
+        """Return the configured template, restoring the bundled default when empty."""
         template = str(self.config.get("prompt_template", "") or "").strip()
-        if template:
-            return template
-        return self._default_prompt_template()
+        return template or self._default_prompt_template()
 
     def _ensure_prompt_template_default(self) -> None:
+        """Restore an empty prompt template in memory and persist it when supported."""
         template = str(self.config.get("prompt_template", "") or "").strip()
         if template:
             return
-
         default_template = self._default_prompt_template()
         if not default_template:
             return
-
         self.config["prompt_template"] = default_template
         save_config = getattr(self.config, "save_config", None)
         if callable(save_config):
@@ -450,33 +510,38 @@ class SchedulerGenerator:
 
     @classmethod
     def _render_prompt_template(cls, template: str, values: dict[str, object]) -> str:
-        """只替换已知占位符，避免用户在 WebUI 中写坏花括号时直接抛异常。"""
+        """Render known placeholders without treating literal JSON braces as fields."""
         placeholder = re.compile(r"\{(\w+)\}")
         left_token = "\u0000LBRACE\u0000"
         right_token = "\u0000RBRACE\u0000"
-
         rendered = template.replace("{{", left_token).replace("}}", right_token)
 
-        def _replace(match: re.Match[str]) -> str:
-            key = match.group(1)
-            return str(values.get(key, ""))
+        def replace(match: re.Match[str]) -> str:
+            return str(values.get(match.group(1), ""))
 
-        rendered = placeholder.sub(_replace, rendered)
+        rendered = placeholder.sub(replace, rendered)
         return rendered.replace(left_token, "{").replace(right_token, "}")
 
     @staticmethod
     @lru_cache(maxsize=1)
     def _default_prompt_template() -> str:
+        """Load the bundled default Prompt template from the plugin schema."""
         schema_path = Path(__file__).resolve().parent.parent / "_conf_schema.json"
         try:
             data = json.loads(schema_path.read_text(encoding="utf-8"))
-            template = data.get("prompt_template", {}).get("default", "")
-            return str(template or "")
+            return str(data.get("prompt_template", {}).get("default", "") or "")
         except Exception:
             return ""
 
-    async def _call_llm(self, prompt: str, *, sid: str = "life_scheduler_gen") -> str:
-        provider_id = self.config.get("llm_provider")
+    async def _call_llm(
+        self,
+        prompt: str,
+        *,
+        sid: str = "life_scheduler_gen",
+        image_urls: list[str] | None = None,
+        provider_id: str | None = None,
+    ) -> str:
+        provider_id = provider_id or self.config.get("llm_provider")
         provider = (
             self.context.get_provider_by_id(provider_id) if provider_id else None
         ) or self.context.get_using_provider()
@@ -486,7 +551,11 @@ class SchedulerGenerator:
 
         try:
             for attempt in range(self._EMPTY_COMPLETION_RETRIES + 1):
-                resp = await provider.text_chat(prompt, session_id=sid)
+                resp = await provider.text_chat(
+                    prompt,
+                    session_id=sid,
+                    image_urls=image_urls or None,
+                )
                 text = self._extract_completion_text(resp)
                 if text:
                     return text
@@ -495,6 +564,81 @@ class SchedulerGenerator:
             raise RuntimeError("API返回的completion为空")
         finally:
             await self._cleanup_session(sid)
+
+    async def _describe_images(
+        self,
+        image_paths: list[str],
+        *,
+        user_text: str = "",
+        sid: str = "life_scheduler_vision",
+    ) -> str:
+        """Turn user images into a durable outfit description.
+
+        Args:
+            image_paths: Local paths or media URLs accepted by the provider.
+            user_text: Text sent alongside the images.
+            sid: Temporary provider session identifier.
+
+        Returns:
+            A detailed Chinese outfit description.
+
+        Raises:
+            RuntimeError: If no provider is available or completion is empty.
+        """
+        prompt = (
+            "你是穿搭档案整理员。请从用户提供的图片和文字中，只提取可长期复用的外观造型。\n"
+            "只允许保留：整体穿搭风格；内搭、上装、下装、外套；鞋袜；包、首饰、帽子等配饰；发型；妆容；"
+            "颜色、图案、材质、版型、层次和搭配关系；赤足、不穿鞋袜等明确穿戴约束。\n"
+            "必须排除：场景、地点、背景、天气、时间、动作、姿势、表情、活动、日程、人物身份、身体外貌、镜头、构图、光线、氛围和非穿戴道具。"
+            "用户文字里的这些内容也必须忽略，不得写进任何字段。\n"
+            "只输出 JSON 对象本体，不要 Markdown、解释或额外字段。看不清的穿戴细节留空，不要猜测。\n"
+            '格式：{"overall_style":"","clothing":"","footwear":"","accessories":"","hair":"","makeup":"","details":"","constraints":""}\n'
+            f"用户补充文字：{user_text or '无'}"
+        )
+        provider_id = (
+            self.config.get("image_provider") or self.config.get("llm_provider")
+            if image_paths
+            else self.config.get("llm_provider")
+        )
+        content = await self._call_llm(
+            prompt,
+            sid=sid,
+            image_urls=image_paths,
+            provider_id=provider_id,
+        )
+        payload = self._extract_json_obj(content)
+        if payload is None:
+            content = await self._call_llm(
+                prompt + "\n上一次输出未能解析。这次必须严格输出上述 JSON 对象本体。",
+                sid=f"{sid}_repair",
+                image_urls=image_paths,
+                provider_id=provider_id,
+            )
+            payload = self._extract_json_obj(content)
+        if payload is None:
+            raise RuntimeError("图片转写模型未返回可解析的穿搭 JSON")
+
+        fields = (
+            ("overall_style", "整体风格"),
+            ("clothing", "服装"),
+            ("footwear", "鞋袜"),
+            ("accessories", "配饰"),
+            ("hair", "发型"),
+            ("makeup", "妆容"),
+            ("details", "颜色材质与版型"),
+            ("constraints", "穿戴约束"),
+        )
+        parts = []
+        for key, label in fields:
+            value = payload.get(key, "")
+            if not isinstance(value, str):
+                continue
+            value = value.strip()
+            if value:
+                parts.append(f"{label}：{value}")
+        if not parts:
+            raise RuntimeError("图片转写模型未返回有效的穿搭字段")
+        return "；".join(parts) + "。"
 
     @staticmethod
     def _extract_completion_text(resp: object) -> str:
@@ -586,13 +730,13 @@ class SchedulerGenerator:
 
         model_style = str(payload.get("outfit_style", "")).strip()
         if model_style != required:
-            return False, f"outfit_style 必须严格等于 \"{required}\""
+            return False, f'outfit_style 必须严格等于 "{required}"'
 
         if not re.match(
             rf"^\s*(?:风格|【风格】|\[风格\])\s*[:：]\s*{re.escape(required)}(?:\s|$)",
             outfit,
         ):
-            return False, f"outfit 第一行必须以 \"风格：{required}\" 开头"
+            return False, f'outfit 第一行必须以 "风格：{required}" 开头'
 
         return True, ""
 
@@ -622,7 +766,9 @@ class SchedulerGenerator:
         if missing_schedule:
             errors.append("日程缺少 " + ", ".join(missing_schedule))
 
-        missing_any = [term for term in requirements["required_any"] if term not in any_text]
+        missing_any = [
+            term for term in requirements["required_any"] if term not in any_text
+        ]
         if missing_any:
             errors.append("内容缺少 " + ", ".join(missing_any))
 
@@ -647,15 +793,18 @@ class SchedulerGenerator:
             return True
         return False
 
-    def _build_style_repair_prompt(self, ctx: ScheduleContext, bad_text: str, reason: str) -> str:
+    def _build_style_repair_prompt(
+        self, ctx: ScheduleContext, bad_text: str, reason: str
+    ) -> str:
         required = (ctx.outfit_style or "").strip()
         return (
             "你之前的输出未通过校验，需要按要求重写。\n"
             f"校验原因：{reason}\n"
             f"必须使用穿搭风格：{required}\n\n"
+            f"必须落实的衣柜方案：{ctx.outfit_plan}\n\n"
             "请只输出 JSON 对象本体，不要 Markdown，不要解释。\n"
             "输出 JSON 必须包含字段：outfit_style、outfit、schedule。\n"
-            f"其中 outfit_style 必须严格等于 \"{required}\"；outfit 第一行必须以 \"风格：{required}\" 开头。\n\n"
+            f'其中 outfit_style 必须严格等于 "{required}"；outfit 第一行必须以 "风格：{required}" 开头。\n\n'
             "你之前的输出（供参考，可能不合规）：\n"
             f"{bad_text}\n"
         )
@@ -672,7 +821,7 @@ class SchedulerGenerator:
             "- 用户补充要求高于随机创意池、穿搭风格、日程类型和历史日程。\n"
             "- 不得忽略、替换或弱化用户指定的具体穿搭、场景和活动。\n"
             "- 请只输出 JSON 对象本体，不要 Markdown，不要解释。\n"
-            '- 输出 JSON 必须包含字段：outfit_style、outfit、schedule。\n\n'
+            "- 输出 JSON 必须包含字段：outfit_style、outfit、schedule。\n\n"
             "你之前的输出（供参考，可能不合规）：\n"
             f"{bad_text}\n"
         )
@@ -684,11 +833,14 @@ class SchedulerGenerator:
         ctx: ScheduleContext,
         *,
         manual_extra: str = "",
+        image_description: str = "",
     ) -> ScheduleData:
         outfit = str(payload.get("outfit", "")).strip() or "日常休闲装"
         schedule = str(payload.get("schedule", "")).strip() or "无"
         if manual_extra:
             outfit_style = "用户指定"
+        elif image_description:
+            outfit_style = "图片指定"
         else:
             outfit_style = str(payload.get("outfit_style", "")).strip() or (
                 ctx.outfit_style or ""
