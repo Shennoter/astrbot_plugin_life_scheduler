@@ -69,7 +69,23 @@ def _install_stubs():
     class QuotedMessageExtractor:
         def __init__(self, event):
             self.event = event
-            self._client = types.SimpleNamespace(call=event.bot.api.call_action)
+
+            async def get_msg(reply_id):
+                return await event.bot.api.call_action("get_msg", message_id=reply_id)
+
+            self._client = types.SimpleNamespace(
+                call=event.bot.api.call_action, get_msg=get_msg
+            )
+            self._reply_parser = types.SimpleNamespace(
+                extract_image_refs_from_reply_component=lambda reply: []
+            )
+            self._payload_parser = types.SimpleNamespace(
+                parse_get_msg_payload=lambda refs: {
+                    "image_refs": refs,
+                    "forward_ids": [],
+                }
+            )
+            self._settings = types.SimpleNamespace(max_forward_fetch=32)
 
         async def _fetch_quoted_content(self, reply, *, fetch_remote):
             refs = await self.event.bot.api.call_action("get_msg", message_id=reply.id)

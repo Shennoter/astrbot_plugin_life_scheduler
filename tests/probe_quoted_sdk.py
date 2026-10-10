@@ -35,7 +35,10 @@ def load_source(name, path, *, functions=None, namespace=None):
     tree = ast.parse(source)
     if functions:
         tree.body = [
-            node for node in tree.body if getattr(node, "name", None) in functions
+            node
+            for node in tree.body
+            if getattr(node, "name", None) in functions
+            or (isinstance(node, ast.ImportFrom) and node.module == "__future__")
         ]
     exec(compile(tree, str(path), "exec"), module.__dict__)  # noqa: S102 - local SDK source
     return module
