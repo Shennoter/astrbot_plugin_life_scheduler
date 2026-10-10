@@ -173,3 +173,48 @@ class ImageInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prepared, refs[:4])
         convert.assert_not_called()
         read.assert_not_called()
+
+    async def test_legacy_sdk_quoted_image_fallback_without_modern_parser(self):
+        image_input = sys.modules[self.module.resolve_image_path.__module__]
+        reply = self.module.Reply()
+        reply.id, reply.chain = "123", []
+        calls = []
+
+        async def call_action(action, **params):
+            calls.append((action, params))
+            self.assertEqual(action, "get_msg")
+            return {
+                "message": [
+                    {
+                        "type": "image",
+                        "data": {"file": "https://example.test/legacy-image"},
+                    }
+                ]
+            }
+
+        event = types.SimpleNamespace(
+            message_obj=types.SimpleNamespace(message=[reply]),
+            bot=types.SimpleNamespace(call_action=call_action),
+        )
+        plugin = object.__new__(self.module.LifeSchedulerPlugin)
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "astrbot.core.utils.quoted_message_parser": None,
+                    "astrbot.core.utils.quoted_message.extractor": None,
+                    "astrbot.core.utils.quoted_message.image_refs": None,
+                    "astrbot.core.utils.quoted_message.image_resolver": None,
+                },
+                clear=False,
+            ),
+            patch.object(
+                image_input,
+                "resolve_image_path",
+                return_value="/tmp/legacy-image.jpg",
+            ),
+        ):
+            paths = await plugin._collect_image_paths(event)
+
+        self.assertEqual(paths, ["/tmp/legacy-image.jpg"])
+        self.assertEqual(calls, [("get_msg", {"message_id": "123"})])

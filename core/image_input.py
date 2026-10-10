@@ -52,17 +52,138 @@ async def _iter_quoted_image_refs(extractor, reply):
         pending.extend(parsed["forward_ids"])
 
 
+def _legacy_message_parts(payload):
+    """Extract OneBot image and forward references from old payload shapes."""
+    image_refs = []
+    forward_ids = []
+
+    def visit(value):
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+            return
+        if not isinstance(value, dict):
+            return
+
+        segment_type = value.get("type")
+        data = value.get("data")
+        if segment_type == "image":
+            image_data = data if isinstance(data, dict) else value
+            for key in ("file", "url", "path"):
+                ref = image_data.get(key)
+                if isinstance(ref, str) and ref.strip():
+                    image_refs.append(ref)
+                    break
+            return
+        if segment_type == "forward":
+            forward_data = data if isinstance(data, dict) else value
+            forward_id = forward_data.get("id") or forward_data.get("res_id")
+            if forward_id is not None:
+                forward_ids.append(str(forward_id))
+            return
+
+        for key in ("data", "message", "messages", "content", "chain"):
+            if key in value:
+                visit(value[key])
+
+    visit(payload)
+    return image_refs, forward_ids
+
+
+def _legacy_payload_data(payload):
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+        return payload["data"]
+    return payload
+
+
+async def _legacy_call_action(event, action, **params):
+    bot = getattr(event, "bot", None)
+    call_action = getattr(bot, "call_action", None)
+    if not callable(call_action):
+        call_action = getattr(getattr(bot, "api", None), "call_action", None)
+    if not callable(call_action):
+        raise TypeError("legacy bot API does not expose call_action")
+    try:
+        return await call_action(action=action, **params)
+    except TypeError:
+        return await call_action(action, params)
+
+
+async def _legacy_image_ref(event, ref):
+    ref = str(ref or "").strip()
+    if not ref:
+        return None
+    if ref.startswith(("http://", "https://", "base64://", "file://", "data:")):
+        return ref
+    if ref.startswith("/"):
+        return ref
+
+    payload = await _legacy_call_action(event, "get_image", file=ref)
+    data = _legacy_payload_data(payload)
+    if isinstance(data, dict):
+        for key in ("url", "file", "path"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+async def _iter_legacy_quoted_image_refs(event, reply):
+    reply_id = str(getattr(reply, "id", "") or "").strip()
+    if not reply_id:
+        return
+    payload = await _legacy_call_action(event, "get_msg", message_id=reply_id)
+    if not payload:
+        return
+    image_refs, forward_ids = _legacy_message_parts(_legacy_payload_data(payload))
+    for ref in image_refs:
+        yield ref
+
+    pending = deque(forward_ids)
+    seen = set()
+    while pending and len(seen) < 32:
+        forward_id = str(pending.popleft() or "").strip()
+        if not forward_id or forward_id in seen:
+            continue
+        seen.add(forward_id)
+        payload = await _legacy_call_action(event, "get_forward_msg", id=forward_id)
+        if not payload:
+            continue
+        image_refs, nested_ids = _legacy_message_parts(_legacy_payload_data(payload))
+        for ref in image_refs:
+            yield ref
+        pending.extend(nested_ids)
+
+
 async def iter_quoted_image_paths(event, reply):
     """Fetch raw quoted references, resolving each only when requested."""
     from astrbot.api.message_components import Image
-    from astrbot.core.utils.quoted_message.extractor import QuotedMessageExtractor
-    from astrbot.core.utils.quoted_message.image_refs import (
-        get_existing_local_path,
-        normalize_image_ref,
-    )
-    from astrbot.core.utils.quoted_message.image_resolver import (
-        _build_image_resolve_actions,
-    )
+
+    try:
+        from astrbot.core.utils.quoted_message.extractor import QuotedMessageExtractor
+        from astrbot.core.utils.quoted_message.image_refs import (
+            get_existing_local_path,
+            normalize_image_ref,
+        )
+        from astrbot.core.utils.quoted_message.image_resolver import (
+            _build_image_resolve_actions,
+        )
+    except ImportError:
+        seen = set()
+        async for ref in _iter_legacy_quoted_image_refs(event, reply):
+            ref = str(ref or "").strip()
+            if not ref or ref in seen:
+                continue
+            seen.add(ref)
+            try:
+                normalized = await _legacy_image_ref(event, ref)
+                if normalized:
+                    yield await resolve_image_path(Image(file=normalized))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to resolve legacy quoted image: %s", type(exc).__name__
+                )
+        return
 
     extractor = QuotedMessageExtractor(event)
     # Both images() and _fetch_quoted_content() traverse every forward eagerly.
