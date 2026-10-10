@@ -44,6 +44,7 @@ pip install holidays APScheduler
 
 | 字段 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
+| `inject_as_temp` | bool | `false` | 开启后将日程状态和衣柜上下文作为本轮临时内容注入，不写入历史，保留原系统提示词；默认继续追加到系统提示词。临时模式使用 AstrBot 的 `TextPart.mark_as_temp()` API，旧版缺少该 API 时回退到系统提示词注入并记录提示 |
 | `schedule_time` | string | `07:00` | 每日自动生成日程的时间 |
 | `reference_history_days` | int | `3` | 生成时参考的历史日程天数 (1-7) |
 | `reference_recent_count` | int | `10` | 生成时参考的近期会话数量，0 表示不参考 |

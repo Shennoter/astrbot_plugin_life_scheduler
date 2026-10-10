@@ -1,4 +1,10 @@
 {
+  "inject_as_temp": {
+    "description": "将日程信息作为临时提示词注入",
+    "hint": "开启后，日程状态和衣柜上下文参与本轮对话，不写入历史，保留原系统提示词。关闭时继续追加到系统提示词。临时模式使用 AstrBot 的 TextPart.mark_as_temp API，旧版缺少该 API 时回退到系统提示词注入。",
+    "type": "bool",
+    "default": false
+  },
   "schedule_time": {
     "description": "每日生成日程的时间 (HH:MM)",
     "hint": "格式为 HH:MM。每天的这个时候生成日程",

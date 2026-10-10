@@ -77,11 +77,22 @@ class LifeSchedulerPlugin(Star):
         """
         components = getattr(getattr(event, "message_obj", None), "message", []) or []
         image_refs: list[str] = []
+        seen: set[str] = set()
+
+        def append_ref(image_ref: str) -> None:
+            image_ref = str(image_ref or "").strip()
+            if image_ref and image_ref not in seen:
+                seen.add(image_ref)
+                image_refs.append(image_ref)
 
         for component in components:
+            # Stop before resolving more attachments: older SDKs decode/write
+            # images synchronously even inside convert_to_file_path().
+            if len(image_refs) >= 4:
+                break
             if isinstance(component, Image):
                 try:
-                    image_refs.append(await component.convert_to_file_path())
+                    append_ref(await component.convert_to_file_path())
                 except Exception as exc:
                     logger.warning("Failed to resolve direct image attachment: %s", exc)
                 continue
@@ -91,11 +102,13 @@ class LifeSchedulerPlugin(Star):
 
             embedded_image = False
             for quoted_component in component.chain or []:
+                if len(image_refs) >= 4:
+                    break
                 if not isinstance(quoted_component, Image):
                     continue
                 embedded_image = True
                 try:
-                    image_refs.append(await quoted_component.convert_to_file_path())
+                    append_ref(await quoted_component.convert_to_file_path())
                 except Exception as exc:
                     logger.warning("Failed to resolve embedded quoted image: %s", exc)
 
@@ -103,18 +116,14 @@ class LifeSchedulerPlugin(Star):
                 continue
 
             try:
-                image_refs.extend(await extract_quoted_message_images(event, component))
+                for image_ref in await extract_quoted_message_images(event, component):
+                    if len(image_refs) >= 4:
+                        break
+                    append_ref(image_ref)
             except Exception as exc:
                 logger.warning("Failed to resolve quoted image fallback: %s", exc)
 
-        deduped: list[str] = []
-        seen: set[str] = set()
-        for image_ref in image_refs:
-            image_ref = str(image_ref or "").strip()
-            if image_ref and image_ref not in seen:
-                seen.add(image_ref)
-                deduped.append(image_ref)
-        return deduped[:4]
+        return image_refs
 
     async def get_life_context(self, *, allow_generate: bool = True) -> dict:
         """Return today's cached life context for other plugins.
@@ -151,7 +160,7 @@ class LifeSchedulerPlugin(Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """System Prompt 注入"""
+        """按配置注入系统提示词或本轮临时上下文。"""
         business_now = resolve_business_now(self.config.get("schedule_time"))
         today = business_now
         umo = event.unified_msg_origin
@@ -182,9 +191,25 @@ class LifeSchedulerPlugin(Star):
             "</life_wardrobe>\n"
         )
 
-        req.system_prompt = (
-            (req.system_prompt or "") + inject_text + wardrobe_instructions
-        )
+        use_temp = self.config.get("inject_as_temp", False)
+        if use_temp:
+            from astrbot.core.agent.message import TextPart
+
+            if callable(getattr(TextPart, "mark_as_temp", None)):
+                req.extra_user_content_parts.append(
+                    TextPart(text=inject_text + wardrobe_instructions).mark_as_temp()
+                )
+            else:
+                use_temp = False
+                logger.warning(
+                    "[LLM] 当前 AstrBot 缺少 TextPart.mark_as_temp，"
+                    "本次使用系统提示词注入；升级 AstrBot 后可使用临时注入。"
+                )
+
+        if not use_temp:
+            req.system_prompt = (
+                (req.system_prompt or "") + inject_text + wardrobe_instructions
+            )
         logger.debug(f"[LLM] 添加的内在状态注入：{inject_text}")
 
     @filter.command("查看日程", alias={"life show"})
