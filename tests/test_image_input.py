@@ -11,7 +11,14 @@ class ImageInputTests(unittest.IsolatedAsyncioTestCase):
         self.module = _load_main()
 
     async def collect(
-        self, *, direct=0, quoted=0, nested=False, broken=False, images_per_forward=1
+        self,
+        *,
+        direct=0,
+        quoted=0,
+        embedded=0,
+        nested=False,
+        broken=False,
+        images_per_forward=1,
     ):
         calls = []
         self.forward_parses = []
@@ -48,7 +55,9 @@ class ImageInputTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self._settings = types.SimpleNamespace(max_forward_fetch=32)
                 self._reply_parser = types.SimpleNamespace(
-                    extract_image_refs_from_reply_component=lambda reply: []
+                    extract_image_refs_from_reply_component=lambda reply: [
+                        f"https://example.test/embedded-{i}" for i in range(embedded)
+                    ]
                 )
                 self._payload_parser = types.SimpleNamespace(
                     parse_get_msg_payload=lambda data: data,
@@ -70,7 +79,9 @@ class ImageInputTests(unittest.IsolatedAsyncioTestCase):
                     refs.extend(item["image_refs"])
                     pending.extend(item["forward_ids"])
                 return types.SimpleNamespace(
-                    embedded_image_refs=[],
+                    embedded_image_refs=[
+                        f"https://example.test/embedded-{i}" for i in range(embedded)
+                    ],
                     direct_image_refs=data["image_refs"],
                     forward_image_refs=refs,
                 )
@@ -128,6 +139,18 @@ class ImageInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(paths), 4)
         self.assertEqual(calls, [("get_msg", "123")])
         self.assertEqual(self.forward_parses, [])
+
+    async def test_embedded_reply_refs_limit_forward_fetch_and_parse(self):
+        for embedded in (2, 4):
+            with self.subTest(embedded=embedded):
+                paths, calls = await self.collect(embedded=embedded)
+                self.assertEqual(len(paths), 4)
+                self.assertEqual(
+                    calls,
+                    ([] if embedded == 4 else [("get_msg", "123")])
+                    + [("get_forward_msg", str(i)) for i in range(4 - embedded)],
+                )
+                self.assertEqual(len(self.forward_parses), 4 - embedded)
 
     async def test_failed_images_and_forward_cycle_preserve_hop_cap(self):
         paths, calls = await self.collect(nested=True, broken=True)
