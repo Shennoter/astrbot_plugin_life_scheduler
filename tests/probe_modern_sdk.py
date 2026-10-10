@@ -141,6 +141,11 @@ async def run_case(
     provider_counts = []
 
     async def text_chat(prompt, *, image_urls, **kwargs):
+        assert len(image_urls) == expected
+        assert all(
+            not ref.startswith(("base64://", "data:")) and Path(ref).is_file()
+            for ref in image_urls
+        ), "modern provider must receive local paths without preencoding"
         assembled = await request_type(
             prompt=prompt, image_urls=image_urls
         ).assemble_context()
@@ -159,6 +164,16 @@ async def run_case(
     )
     plugin.generator = module.SchedulerGenerator(context, {}, plugin.data_mgr)
     reads, writes, encodes = [], [], []
+    forward_parses = []
+    payload_parser = sys.modules[
+        "astrbot.core.utils.quoted_message.chain_parser"
+    ].OneBotPayloadParser
+    parse_forward = payload_parser.parse_get_forward_payload
+
+    def parse(parser, payload):
+        forward_parses.append(threading.get_ident())
+        return parse_forward(parser, payload)
+
     read_bytes, write_bytes, b64encode = (
         Path.read_bytes,
         Path.write_bytes,
@@ -195,6 +210,7 @@ async def run_case(
             patch.object(Path, "read_bytes", read),
             patch.object(Path, "write_bytes", write),
             patch.object(base64, "b64encode", encode),
+            patch.object(payload_parser, "parse_get_forward_payload", parse),
         ):
             replies = [result async for result in plugin.wardrobe_add(event, "")]
     finally:
@@ -208,6 +224,7 @@ async def run_case(
         "inline": inline,
         "image_bytes": len(raw),
         "forward_fetches": calls.count("get_forward_msg"),
+        "forward_parses": len(forward_parses),
         "expected_forward_fetches": expected_forward,
         "get_image": calls.count("get_image"),
         "reads": len(reads),
@@ -221,6 +238,8 @@ async def run_case(
     assert replies[-1].startswith("已放进衣柜"), replies
     assert provider_counts == [expected]
     assert calls.count("get_forward_msg") == expected_forward, stats
+    assert len(forward_parses) == expected_forward, stats
+    assert all(thread != loop_thread for thread in forward_parses), stats
     assert calls.count("get_image") == expected - direct, stats
     assert len(writes) == (expected if inline else 0), stats
     assert len(reads) == len(encodes) == expected, stats
