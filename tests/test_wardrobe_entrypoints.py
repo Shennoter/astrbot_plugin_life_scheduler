@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import json
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -47,6 +49,19 @@ class WardrobeEntrypointTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.generator = self.module.SchedulerGenerator(
             context, self.plugin.config, self.plugin.data_mgr
         )
+        # These entrypoint tests use symbolic paths. Real encoding is exercised
+        # separately below and by the SDK integration probe.
+        self.encoding_patch = patch(
+            f"{self.module.SchedulerGenerator.__module__}.prepare_provider_images",
+            AsyncMock(side_effect=lambda refs: refs),
+        )
+        self.encoding_patch.start()
+        self.addCleanup(self.encoding_patch.stop)
+
+    @staticmethod
+    async def quoted_refs(refs):
+        for ref in refs:
+            yield ref
 
     def image(self, path="quoted.png", *, error=None):
         component = self.module.Image()
@@ -99,11 +114,11 @@ class WardrobeEntrypointTests(unittest.IsolatedAsyncioTestCase):
     async def test_reply_id_fallback_persists_outfit(self):
         with patch.object(
             self.module,
-            "extract_quoted_message_images",
-            AsyncMock(return_value=["fallback.png"]),
+            "iter_quoted_image_paths",
+            return_value=self.quoted_refs(["fallback.png"]),
         ) as fallback:
             replies = await self.run_command(self.event(self.reply()))
-        fallback.assert_awaited_once()
+        fallback.assert_called_once()
         self.assertTrue(replies[-1].startswith("已放进衣柜"))
         self.assert_saved()
 
@@ -126,11 +141,9 @@ class WardrobeEntrypointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_many_direct_images_stop_resolving_after_four(self):
         images = [self.image(f"{n}.png") for n in range(32)]
-        with patch.object(
-            self.module, "extract_quoted_message_images", AsyncMock()
-        ) as fallback:
+        with patch.object(self.module, "iter_quoted_image_paths") as fallback:
             await self.run_command(self.event(*images, self.reply()))
-        fallback.assert_not_awaited()
+        fallback.assert_not_called()
         self.assertEqual(
             sum(image.convert_to_file_path.await_count for image in images), 4
         )
@@ -169,10 +182,9 @@ class WardrobeEntrypointTests(unittest.IsolatedAsyncioTestCase):
     async def test_fallback_deduplicates_and_stops_at_four(self):
         with patch.object(
             self.module,
-            "extract_quoted_message_images",
-            AsyncMock(
-                return_value=["", " 0.png ", "0.png"]
-                + [f"{n}.png" for n in range(1, 32)]
+            "iter_quoted_image_paths",
+            return_value=self.quoted_refs(
+                ["", " 0.png ", "0.png"] + [f"{n}.png" for n in range(1, 32)]
             ),
         ):
             await self.run_command(self.event(self.reply()))
@@ -265,3 +277,164 @@ class WardrobeEntrypointTests(unittest.IsolatedAsyncioTestCase):
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+    async def test_small_batches_convert_off_loop_and_allow_heartbeat(self):
+        for count in (1, 3):
+            for quoted in (False, True):
+                with self.subTest(count=count, quoted=quoted):
+                    loop_thread = threading.get_ident()
+                    conversion_threads = []
+                    entered = threading.Event()
+                    release = threading.Event()
+                    ticks = []
+                    images = []
+
+                    async def heartbeat(entered=entered, ticks=ticks, release=release):
+                        while not entered.is_set():
+                            await asyncio.sleep(0.001)
+                        ticks.append(1)
+                        release.set()
+
+                    for index in range(count):
+                        target = self.root / f"small-{index}.png"
+
+                        async def convert(
+                            path=target,
+                            conversion_threads=conversion_threads,
+                            entered=entered,
+                            release=release,
+                        ):
+                            conversion_threads.append(threading.get_ident())
+                            entered.set()
+                            release.wait(0.15)
+                            path.write_bytes(base64.b64decode("aW1hZ2U="))
+                            return str(path)
+
+                        image = self.image()
+                        image.convert_to_file_path.side_effect = convert
+                        images.append(image)
+                    beat = asyncio.create_task(heartbeat())
+                    try:
+                        refs = await self.plugin._collect_image_paths(
+                            self.event(self.reply(*images))
+                            if quoted
+                            else self.event(*images)
+                        )
+                        self.assertEqual(len(refs), count)
+                        self.assertNotIn(loop_thread, conversion_threads)
+                        self.assertTrue(
+                            ticks, "heartbeat did not run during conversion"
+                        )
+                    finally:
+                        release.set()
+                        beat.cancel()
+                        await asyncio.gather(beat, return_exceptions=True)
+
+    async def test_reply_fetch_resolves_only_remaining_slots(self):
+        for direct_count in (0, 2, 4):
+            with self.subTest(direct_count=direct_count):
+                calls = []
+                loop_thread = threading.get_ident()
+
+                async def call_action(
+                    action,
+                    params=None,
+                    *,
+                    loop_thread=loop_thread,
+                    calls=calls,
+                    **kwargs,
+                ):
+                    self.assertEqual(threading.get_ident(), loop_thread)
+                    calls.append(action)
+                    if action == "get_msg":
+                        return [f"id-{index}" for index in range(32)]
+                    return {"url": f"https://example.test/{params['file']}.png"}
+
+                event = self.event(
+                    *[self.image(f"direct-{i}.png") for i in range(direct_count)],
+                    self.reply(),
+                )
+                event.bot = types.SimpleNamespace(
+                    api=types.SimpleNamespace(call_action=call_action)
+                )
+                refs = await self.plugin._collect_image_paths(event)
+                self.assertEqual(len(refs), 4)
+                self.assertEqual(calls.count("get_image"), 4 - direct_count)
+                self.assertEqual(calls.count("get_msg"), int(direct_count < 4))
+
+    async def test_single_image_provider_file_encoding_runs_off_loop(self):
+        self.encoding_patch.stop()
+        source = self.root / "provider.png"
+        payload = b"actual image bytes for provider encoding"
+        source.write_bytes(payload)
+        loop_thread = threading.get_ident()
+        read_threads = []
+        original_read = Path.read_bytes
+
+        def read_bytes(path):
+            read_threads.append(threading.get_ident())
+            return original_read(path)
+
+        async def text_chat(*args, image_urls, **kwargs):
+            ref = image_urls[0]
+            if ref.startswith("base64://"):
+                decoded = base64.b64decode(ref.removeprefix("base64://"))
+            else:
+                decoded = Path(ref).read_bytes()
+            self.assertEqual(decoded, payload)
+            return types.SimpleNamespace(completion_text='{"clothing":"白衬衫"}')
+
+        self.provider.text_chat.side_effect = text_chat
+        with patch.object(Path, "read_bytes", read_bytes):
+            await self.run_command(self.event(self.reply(self.image(str(source)))))
+        self.assert_saved()
+        self.assertTrue(read_threads)
+        self.assertNotIn(loop_thread, read_threads)
+
+    async def test_provider_cap_precedes_file_reads_and_retries_reuse_encoding(self):
+        self.encoding_patch.stop()
+        paths = []
+        for i in range(4):
+            path = self.root / f"provider-{i}.png"
+            path.write_bytes(f"image-{i}".encode())
+            paths.append(str(path))
+        # Accessing any excess path fails; the limit must precede all file work.
+        paths.extend([str(self.root / "must-not-open.png")] * 28)
+        self.provider.text_chat.side_effect = [
+            types.SimpleNamespace(completion_text=""),
+            types.SimpleNamespace(completion_text="done"),
+        ]
+        with patch.object(
+            Path, "read_bytes", autospec=True, side_effect=Path.read_bytes
+        ) as read:
+            result = await self.plugin.generator._call_llm("test", image_urls=paths)
+        self.assertEqual(result, "done")
+        self.assertEqual(read.call_count, 4)
+        calls = self.provider.text_chat.call_args_list
+        self.assertEqual(calls[0].kwargs["image_urls"], calls[1].kwargs["image_urls"])
+        self.assertEqual(len(calls[0].kwargs["image_urls"]), 4)
+
+    async def test_reply_fetch_converts_single_image_off_loop(self):
+        threads = []
+        target = self.root / "fetched.png"
+
+        async def convert(component):
+            threads.append(threading.get_ident())
+            target.write_bytes(
+                base64.b64decode(component.file.removeprefix("base64://"))
+            )
+            return str(target)
+
+        async def call_action(action, **kwargs):
+            self.assertEqual(action, "get_msg")
+            return ["base64://aW1hZ2U="]
+
+        event = self.event(self.reply())
+        event.bot = types.SimpleNamespace(
+            api=types.SimpleNamespace(call_action=call_action)
+        )
+        with patch.object(self.module.Image, "convert_to_file_path", convert):
+            refs = await self.plugin._collect_image_paths(event)
+        self.assertEqual(refs, [str(target)])
+        self.assertEqual(target.read_bytes(), b"image")
+        self.assertNotIn(threading.get_ident(), threads)

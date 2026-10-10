@@ -12,6 +12,7 @@ from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.star.context import Context
 
 from .data import ScheduleData, ScheduleDataManager
+from .image_input import prepare_provider_images
 
 _STYLE_PREFIX_RE = re.compile(
     r"^\s*(?:【?风格】?|\[?风格\]?)\s*[:：]\s*(?P<style>.+?)(?:\n|$)"
@@ -550,11 +551,12 @@ class SchedulerGenerator:
             raise RuntimeError("No provider")
 
         try:
+            prepared_images = await prepare_provider_images(image_urls or [])
             for attempt in range(self._EMPTY_COMPLETION_RETRIES + 1):
                 resp = await provider.text_chat(
                     prompt,
                     session_id=sid,
-                    image_urls=image_urls or None,
+                    image_urls=prepared_images or None,
                 )
                 text = self._extract_completion_text(resp)
                 if text:

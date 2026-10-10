@@ -43,7 +43,16 @@ def _install_stubs():
     api_event.AstrMessageEvent = object
     api_event.filter = _Filter()
     api_components = types.ModuleType("astrbot.api.message_components")
-    api_components.Image = type("Image", (), {})
+
+    class Image:
+        def __init__(self, file=""):
+            self.file = file
+            self.url = ""
+
+        async def convert_to_file_path(self):
+            return self.file
+
+    api_components.Image = Image
     api_components.Reply = type("Reply", (), {})
     config = types.ModuleType("astrbot.core.config.astrbot_config")
     config.AstrBotConfig = dict
@@ -57,10 +66,43 @@ def _install_stubs():
     command.GreedyStr = str
     quoted = types.ModuleType("astrbot.core.utils.quoted_message_parser")
 
-    async def extract_quoted_message_images(*args, **kwargs):
-        return []
+    class QuotedMessageExtractor:
+        def __init__(self, event):
+            self.event = event
+            self._client = types.SimpleNamespace(call=event.bot.api.call_action)
+
+        async def _fetch_quoted_content(self, reply, *, fetch_remote):
+            refs = await self.event.bot.api.call_action("get_msg", message_id=reply.id)
+            return types.SimpleNamespace(
+                embedded_image_refs=[], direct_image_refs=refs, forward_image_refs=[]
+            )
+
+        async def images(self, reply):
+            content = await self._fetch_quoted_content(reply, fetch_remote=True)
+            return [
+                await self.event.bot.api.call_action("get_image", {"file": ref})
+                for ref in content.direct_image_refs
+            ]
+
+    async def extract_quoted_message_images(event, reply):
+        if not hasattr(event, "bot"):
+            return []
+        return await QuotedMessageExtractor(event).images(reply)
 
     quoted.extract_quoted_message_images = extract_quoted_message_images
+    extractor = types.ModuleType("astrbot.core.utils.quoted_message.extractor")
+    extractor.QuotedMessageExtractor = QuotedMessageExtractor
+    image_refs = types.ModuleType("astrbot.core.utils.quoted_message.image_refs")
+    image_refs.normalize_image_ref = lambda ref: (
+        ref if ref.startswith(("http://", "https://", "base64://")) else None
+    )
+    image_refs.get_existing_local_path = lambda ref: None
+    image_resolver = types.ModuleType(
+        "astrbot.core.utils.quoted_message.image_resolver"
+    )
+    image_resolver._build_image_resolve_actions = lambda event, ref: [
+        ("get_image", {"file": ref})
+    ]
     context = types.ModuleType("astrbot.core.star.context")
     context.Context = object
     schedule = types.ModuleType(f"{PACKAGE}.core.schedule")
@@ -77,6 +119,9 @@ def _install_stubs():
             "astrbot.core.star.star_tools": star_tools,
             "astrbot.core.star.filter.command": command,
             "astrbot.core.utils.quoted_message_parser": quoted,
+            "astrbot.core.utils.quoted_message.extractor": extractor,
+            "astrbot.core.utils.quoted_message.image_refs": image_refs,
+            "astrbot.core.utils.quoted_message.image_resolver": image_resolver,
             "astrbot.core.star.context": context,
             f"{PACKAGE}.core.schedule": schedule,
         }

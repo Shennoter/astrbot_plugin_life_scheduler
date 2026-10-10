@@ -255,11 +255,11 @@ class SchedulerBehaviorTest(unittest.IsolatedAsyncioTestCase):
         data = await generator.generate_schedule(
             datetime.datetime(2026, 5, 24),
             extra="上班",
-            image_paths=["/tmp/outfit.jpg"],
+            image_paths=["base64://aW1hZ2U="],
         )
         self.assertEqual(data.status, "ok")
         self.assertEqual(len(provider.image_urls), 2)
-        self.assertEqual(provider.image_urls[0], ["/tmp/outfit.jpg"])
+        self.assertEqual(provider.image_urls[0], ["base64://aW1hZ2U="])
         self.assertEqual(provider.image_urls[1], [])
         self.assertIn("必须排除", provider.prompts[0])
 
@@ -276,7 +276,7 @@ class SchedulerBehaviorTest(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
-        result = await generator._describe_images(["/tmp/look.jpg"])
+        result = await generator._describe_images(["base64://aW1hZ2U="])
 
         self.assertIn("白色短袖", result)
         self.assertIn("赤足", result)

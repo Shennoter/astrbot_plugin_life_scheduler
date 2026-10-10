@@ -8,10 +8,10 @@ from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.star.star_tools import StarTools
 from astrbot.core.star.filter.command import GreedyStr
-from astrbot.core.utils.quoted_message_parser import extract_quoted_message_images
 
 from .core.data import ScheduleDataManager, WardrobeDataManager
 from .core.generator import SchedulerGenerator
+from .core.image_input import iter_quoted_image_paths, resolve_image_path
 from .core.images import WardrobeImageStore
 from .core.schedule import LifeScheduler
 from .core.utils import build_character_state_injection, resolve_business_now
@@ -92,7 +92,7 @@ class LifeSchedulerPlugin(Star):
                 break
             if isinstance(component, Image):
                 try:
-                    append_ref(await component.convert_to_file_path())
+                    append_ref(await resolve_image_path(component))
                 except Exception as exc:
                     logger.warning("Failed to resolve direct image attachment: %s", exc)
                 continue
@@ -108,7 +108,7 @@ class LifeSchedulerPlugin(Star):
                     continue
                 embedded_image = True
                 try:
-                    append_ref(await quoted_component.convert_to_file_path())
+                    append_ref(await resolve_image_path(quoted_component))
                 except Exception as exc:
                     logger.warning("Failed to resolve embedded quoted image: %s", exc)
 
@@ -116,10 +116,10 @@ class LifeSchedulerPlugin(Star):
                 continue
 
             try:
-                for image_ref in await extract_quoted_message_images(event, component):
+                async for image_ref in iter_quoted_image_paths(event, component):
+                    append_ref(image_ref)
                     if len(image_refs) >= 4:
                         break
-                    append_ref(image_ref)
             except Exception as exc:
                 logger.warning("Failed to resolve quoted image fallback: %s", exc)
 
