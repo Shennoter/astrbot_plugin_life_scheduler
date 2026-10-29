@@ -1,12 +1,18 @@
 # AstrBot Life Scheduler Plugin
 
-为 AstrBot 设计的拟人化生活日程插件。利用 LLM 根据日期、节日、历史日程和近期对话，自动生成每日穿搭和日程安排，并注入到 System Prompt，让 Bot 拥有连续的"生活"状态。
+> **缓存优化 fork · v2.8.0-cache.1**
+>
+> 基于木有知的原版维护，保留原作者署名。固定规则留在系统提示词，动态状态通过本轮临时内容注入，
+> 减少活动、穿搭和衣柜变化对前缀缓存的影响。安装及后续更新地址：
+> [Shennoter/astrbot_plugin_life_scheduler](https://github.com/Shennoter/astrbot_plugin_life_scheduler)。
+
+为 AstrBot 设计的拟人化生活日程插件。利用 LLM 根据日期、节日、历史日程和近期对话，自动生成每日穿搭和日程安排，并注入模型上下文，让 Bot 拥有连续的"生活"状态。
 
 ## 功能特性
 
 - **日程生成**: 结合日期、节日、历史日程和近期对话，生成拟人化日程
 - **衣柜穿搭**: 从可编辑衣柜中选取一套作为今日穿搭基准
-- **System Prompt 注入**: 自动将当日状态注入 LLM 上下文，Bot 会"记得"自己今天穿了什么、在做什么
+- **缓存友好的状态注入**: 固定规则追加到 System Prompt，当日状态与衣柜列表默认作为本轮临时内容注入
 - **当前状态提取**: 对含时间点的日程自动提取当前或最近活动，减少对话中说出与日程冲突的状态
 - **懒加载**: 未到生成时间时，首次对话自动触发生成
 - **补充要求**: 重写日程时可附加自定义要求，让生成更符合预期
@@ -44,7 +50,7 @@ pip install holidays APScheduler
 
 | 字段 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `inject_as_temp` | bool | `false` | 开启后将日程状态和衣柜上下文作为本轮临时内容注入，不写入历史，保留原系统提示词；默认继续追加到系统提示词。临时模式使用 AstrBot 的 `TextPart.mark_as_temp()` API，旧版缺少该 API 时回退到系统提示词注入并记录提示 |
+| `inject_as_temp` | bool | `true` | 开启后固定规则留在系统提示词，动态日程和衣柜列表作为本轮临时内容注入，不写入历史。关闭或旧版缺少临时内容 API 时使用系统提示词注入，并记录兼容提示 |
 | `schedule_time` | string | `07:00` | 每日自动生成日程的时间 |
 | `reference_history_days` | int | `3` | 生成时参考的历史日程天数 (1-7) |
 | `reference_recent_count` | int | `10` | 生成时参考的近期会话数量，0 表示不参考 |
@@ -96,6 +102,30 @@ pip install holidays APScheduler
 今日日程: 上午整理房间，下午去咖啡厅看书...
 </character_state>
 ```
+
+默认将上面的状态及衣柜列表放进 `extra_user_content_parts`，通过 `TextPart.mark_as_temp()`
+标记为本轮临时内容。状态遵循规则、衣柜工具使用规则放在系统提示词中；动态状态变化时，这些固定规则保持一致。
+衣柜列表只是供本轮参考的快照，修改、删除前仍需调用衣柜工具获取最新数据。
+
+已有配置如果明确保存了 `inject_as_temp=false`，升级后仍会保留该值；请在插件配置中打开
+“缓存优化：将动态日程作为临时内容注入”。缺少临时内容 API 的旧版 AstrBot 会使用系统提示词兼容模式。
+
+配合群聊增强的主动聊天时，请使用
+[群聊增强缓存 fork](https://github.com/Shennoter/astrbot_plugin_group_chat_plus)
+`V1.2.3.hotfix.2-cache.2` 或后续版本，其群聊、私聊主动发言会转发临时内容。
+普通 AstrBot 内置 AI 通过标准请求流程处理这些内容。
+
+### 验证
+
+回归测试覆盖临时注入、动态状态更新、固定规则去重、显式关闭、旧 SDK 兼容，以及原有日程和衣柜功能。
+额外的 SDK 探针加载实际消息序列化代码，检查状态参与当前请求且保存历史时被移除，并可验证群聊增强的主动调用边界：
+
+```sh
+python -m pytest -q tests
+python tests/probe_prompt_cache.py /path/to/AstrBot --group-chat-plus /path/to/group-chat-plus-fork
+```
+
+测试不调用模型或发送消息。实际命中率取决于模型、中转、请求间隔与历史裁剪方式，需上线后比较未缓存输入量和费用。
 
 ### 自然语言维护
 

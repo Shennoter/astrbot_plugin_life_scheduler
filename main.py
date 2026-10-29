@@ -6,15 +6,32 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Image, Reply
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.provider.entities import ProviderRequest
-from astrbot.core.star.star_tools import StarTools
 from astrbot.core.star.filter.command import GreedyStr
+from astrbot.core.star.star_tools import StarTools
 
 from .core.data import ScheduleDataManager, WardrobeDataManager
 from .core.generator import SchedulerGenerator
 from .core.image_input import iter_quoted_image_paths, resolve_image_path
 from .core.images import WardrobeImageStore
 from .core.schedule import LifeScheduler
-from .core.utils import build_character_state_injection, resolve_business_now
+from .core.utils import (
+    STATE_FOLLOWING_RULES,
+    build_character_state_injection,
+    resolve_business_now,
+)
+
+LIFE_CONTEXT_RULES = (
+    STATE_FOLLOWING_RULES
+    + """
+<life_wardrobe_rules>
+<life_wardrobe> 是插件保存的备选穿搭方案，编号按配置顺序固定，新方案追加到末尾。
+当用户要查看、删除或修改某套方案时，先调用 life_wardrobe_list 获取最新编号和完整描述，
+再调用对应的衣柜工具；用户明确要求加入衣柜时调用 life_wardrobe_add。
+衣柜只保存服装、鞋袜、配饰、发型、妆容和造型细节，不得把场景、动作、日程、天气或镜头描述当作穿搭传入。
+当用户要求修改今天的穿搭或日程时调用 life_schedule_edit。除非用户明确提出，不要主动改写或删除数据。
+</life_wardrobe_rules>
+"""
+)
 
 
 class LifeSchedulerPlugin(Star):
@@ -160,7 +177,7 @@ class LifeSchedulerPlugin(Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """按配置注入系统提示词或本轮临时上下文。"""
+        """Keep fixed rules in system text and current state in temporary content."""
         business_now = resolve_business_now(self.config.get("schedule_time"))
         today = business_now
         umo = event.unified_msg_origin
@@ -177,39 +194,39 @@ class LifeSchedulerPlugin(Star):
             data.outfit,
             data.schedule,
             business_now=business_now,
+            include_rules=False,
         )
 
         wardrobe_text = self.wardrobe_mgr.for_prompt(limit=20, max_chars=8000)
-        wardrobe_instructions = (
-            "\n<life_wardrobe>\n"
-            "这是插件保存的备选穿搭方案，编号按配置顺序固定，新方案追加到末尾。\n"
-            f"{wardrobe_text}\n"
-            "当用户要查看、删除或修改某套方案时，先调用 life_wardrobe_list 获取最新编号和完整描述，"
-            "再调用对应的衣柜工具；用户明确要求加入衣柜时调用 life_wardrobe_add。"
-            "衣柜只保存服装、鞋袜、配饰、发型、妆容和造型细节，不得把场景、动作、日程、天气或镜头描述当作穿搭传入。\n"
-            "当用户要求修改今天的穿搭或日程时调用 life_schedule_edit。除非用户明确提出，不要主动改写或删除数据。\n"
-            "</life_wardrobe>\n"
-        )
+        wardrobe_context = f"\n<life_wardrobe>\n{wardrobe_text}\n</life_wardrobe>\n"
+        runtime_context = inject_text + wardrobe_context
 
-        use_temp = self.config.get("inject_as_temp", False)
+        use_temp = self.config.get("inject_as_temp", True)
+        temp_part = None
         if use_temp:
-            from astrbot.core.agent.message import TextPart
-
-            if callable(getattr(TextPart, "mark_as_temp", None)):
-                req.extra_user_content_parts.append(
-                    TextPart(text=inject_text + wardrobe_instructions).mark_as_temp()
-                )
+            try:
+                from astrbot.core.agent.message import TextPart
+            except ImportError:
+                TextPart = None
+            if callable(getattr(TextPart, "mark_as_temp", None)) and isinstance(
+                getattr(req, "extra_user_content_parts", None), list
+            ):
+                temp_part = TextPart(text=runtime_context).mark_as_temp()
             else:
                 use_temp = False
                 logger.warning(
-                    "[LLM] 当前 AstrBot 缺少 TextPart.mark_as_temp，"
-                    "本次使用系统提示词注入；升级 AstrBot 后可使用临时注入。"
+                    "[LLM] Temporary content API unavailable; using legacy system "
+                    "injection. Upgrade AstrBot to preserve prompt-cache prefixes."
                 )
 
-        if not use_temp:
-            req.system_prompt = (
-                (req.system_prompt or "") + inject_text + wardrobe_instructions
-            )
+        system_prompt = req.system_prompt or ""
+        if LIFE_CONTEXT_RULES not in system_prompt:
+            system_prompt += LIFE_CONTEXT_RULES
+        req.system_prompt = system_prompt
+        if use_temp:
+            req.extra_user_content_parts.append(temp_part)
+        else:
+            req.system_prompt += runtime_context
         logger.debug(f"[LLM] 添加的内在状态注入：{inject_text}")
 
     @filter.command("查看日程", alias={"life show"})

@@ -266,7 +266,7 @@ async def check_injection(module, sdk, request_type):
     event = types.SimpleNamespace(unified_msg_origin="test:FriendMessage:1")
     await plugin.on_llm_request(event, req)
     runtime = message.Message.model_validate(await req.assemble_context())
-    assert req.system_prompt == "原有人设"
+    assert req.system_prompt == "原有人设" + module.LIFE_CONTEXT_RULES
     assert "白衬衫" in str(runtime.model_dump())
     assert "<life_wardrobe>" in str(runtime.model_dump())
     assert message.dump_messages_with_checkpoints([runtime]) == [
@@ -281,9 +281,9 @@ async def check_injection(module, sdk, request_type):
     del plugin.config["inject_as_temp"]
     default_req = request_type(prompt="test", system_prompt="原有人设")
     await plugin.on_llm_request(event, default_req)
-    assert "白衬衫" in default_req.system_prompt
-    assert default_req.extra_user_content_parts == []
-    print("PASS temporary injection/history removal and default system injection")
+    assert default_req.system_prompt == "原有人设" + module.LIFE_CONTEXT_RULES
+    assert "白衬衫" in default_req.extra_user_content_parts[-1].text
+    print("PASS temporary injection/history removal and stable system rules")
 
 
 async def main():

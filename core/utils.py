@@ -97,14 +97,34 @@ def select_current_activity(
     return current
 
 
+STATE_FOLLOWING_RULES = """
+<state_following_rules>
+- 当用户问到正在做什么、今天安排、所在场景、穿着或生活状态时，必须以 <character_state> 为准。
+- 不得编造与当前状态或今日日程冲突的上课、上班、外出、睡觉等状态。
+- 与用户问题无关时无需主动提及这些状态。
+</state_following_rules>"""
+
+
 def build_character_state_injection(
     outfit: str,
     schedule: str,
     *,
     now: datetime.datetime | None = None,
     business_now: datetime.datetime | None = None,
+    include_rules: bool = True,
 ) -> str:
-    """Build the system prompt fragment injected into normal LLM requests."""
+    """Build current state, optionally including the stable following rules.
+
+    Args:
+        outfit: Today's outfit description.
+        schedule: Today's complete schedule.
+        now: Current wall-clock time, defaulting to local time.
+        business_now: Business date used to select overnight activities.
+        include_rules: Include static rules for legacy system-prompt injection.
+
+    Returns:
+        The state fragment, with optional static rules for backwards compatibility.
+    """
     now = now or datetime.datetime.now()
     business_now = business_now or now
     current_activity = select_current_activity(
@@ -114,15 +134,11 @@ def build_character_state_injection(
     )
     current_state = current_activity or "未解析到具体时间点，请按今日日程整体保持一致"
 
-    return f"""
+    state_text = f"""
 <character_state>
 时间: {time_desc(now.hour)}
 穿着: {outfit}
 当前状态: {current_state}
 今日日程: {schedule}
-</character_state>
-<state_following_rules>
-- 当用户问到正在做什么、今天安排、所在场景、穿着或生活状态时，必须以 <character_state> 为准。
-- 不得编造与当前状态或今日日程冲突的上课、上班、外出、睡觉等状态。
-- 与用户问题无关时无需主动提及这些状态。
-</state_following_rules>"""
+</character_state>"""
+    return state_text + (STATE_FOLLOWING_RULES if include_rules else "")
